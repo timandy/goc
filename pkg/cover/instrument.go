@@ -46,6 +46,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,9 +62,17 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	_cover {{.GlobalCoverVarImportPath | printf "%q"}}
 
+)
+
+const heartbeatInterval = time.Second * 10
+
+var (
+	gocTicker   *time.Ticker
+	gocStopChan chan struct{}
 )
 
 func init() {
@@ -132,36 +141,19 @@ func clearFileCoverGoc(counter []uint32) {
 }
 
 func registerHandlersGoc() {
-	{{if .Singleton}}
-	ln, _, err := listenGoc()
-	{{else}}
-	ln, host, err := listenGoc()
-	{{end}}
+	ln, err := listenGoc()
 	if err != nil {
-		_log.Fatalf("listenGoc failed, err:%v", err)
+		_log.Fatalf("listen failed, err:%v", err)
+		return
 	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	genProfileAddrGoc(port)
 	{{if not .Singleton}}
-	profileAddr := "http://" + host
-	if resp, err := registerSelfGoc(profileAddr); err != nil {
-		_log.Fatalf("register address %v failed, err: %v, response: %v", profileAddr, err, string(resp))
+	if resp, err := registerSelfGoc(port); err != nil {
+		_log.Fatalf("register address failed, err: %v, response: %v", err, string(resp))
 	}
-
-	fn := func() {
-		var (
-			err          error
-			profileAddrs []string
-			addresses    []string
-		)
-		if addresses, err = getAllHostsGoc(ln); err != nil {
-			_log.Fatalf("get all host failed, err: %v", err)
-			return
-		}
-		for _, addr := range addresses {
-			profileAddrs = append(profileAddrs, "http://"+addr)
-		}
-		deregisterSelfGoc(profileAddrs)
-	}
-	go watchSignalGoc(fn)
+	registerTickerGoc(port)
+	defer releaseTickerGoc()
 	{{end}}
 
 	mux := http.NewServeMux()
@@ -219,10 +211,11 @@ func registerHandlersGoc() {
 		fmt.Fprintln(w, "clear call successfully")
 	})
 
-	_log.Fatal(http.Serve(ln, mux))
+	server := &http.Server{Handler: mux}
+	runClientGoc(server, ln, port)
 }
 
-func registerSelfGoc(address string) ([]byte, error) {
+func registerSelfGoc(port int) ([]byte, error) {
 	customServiceName, ok := os.LookupEnv("GOC_SERVICE_NAME")
 	var selfName string
 	if ok {
@@ -230,7 +223,11 @@ func registerSelfGoc(address string) ([]byte, error) {
 	} else {
 		selfName = filepath.Base(os.Args[0])
 	}
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/v1/cover/register?name=%s&address=%s", {{.Center | printf "%q"}}, selfName, address), nil)
+	host, err := getRealHostGoc(port)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/v1/cover/register?name=%s&address=%s", {{.Center | printf "%q"}}, selfName, "http://" + host), nil)
 	if err != nil {
 		_log.Fatalf("http.NewRequest failed: %v", err)
 		return nil, err
@@ -258,7 +255,16 @@ func registerSelfGoc(address string) ([]byte, error) {
 	return body, err
 }
 
-func deregisterSelfGoc(address []string) ([]byte, error) {
+func deregisterSelfGoc(port int) ([]byte, error) {
+	addrs, err := getAllHostsGoc(port)
+	if err != nil {
+		_log.Printf("get all host failed, err: %v", err)
+		return nil, err
+	}
+	var address []string
+	for _, addr := range addrs {
+		address = append(address, "http://"+addr)
+	}
 	param := map[string]interface{}{
 		"address": address,
 	}
@@ -295,23 +301,32 @@ func deregisterSelfGoc(address []string) ([]byte, error) {
 	return body, err
 }
 
-type CallbackGocFunc func()
-
-func watchSignalGoc(fn CallbackGocFunc) {
-	// init signal
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
-	for {
-		si := <-c
-		_log.Printf("get a signal %s", si.String())
-		switch si {
-		case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
-			fn()
-			os.Exit(0) // Exit successfully.
-		case syscall.SIGHUP:
-		default:
+func runClientGoc(server *http.Server, ln net.Listener, port int) {
+	errorChan := make(chan error, 1)
+	quitChan := make(chan os.Signal, 1)
+	// 监听系统信号
+	signal.Notify(quitChan, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+	// 异步启动服务
+	go func() {
+		errorChan <- server.Serve(ln)
+	}()
+	// 等待监听失败或收到退出信号
+	select {
+	case err := <-errorChan:
+		_log.Fatalf("goc client failed to start, %v", err)
+	case <-quitChan:
+		_log.Printf("goc client is shutting down...")
+		{{if not .Singleton}}
+		deregisterSelfGoc(port)
+		{{end}}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*1)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			_ = server.Close()
+			_log.Printf("goc client already forced shutdown, %v", err)
 			return
 		}
+		_log.Printf("goc client already shutdown")
 	}
 }
 
@@ -323,35 +338,24 @@ func isNetworkErrorGoc(err error) bool {
 	return ok
 }
 
-func listenGoc() (ln net.Listener, host string, err error) {
+func listenGoc() (ln net.Listener, err error) {
 	agentPort := "{{.AgentPort }}"
 	if agentPort != "" {
-		if ln, err = net.Listen("tcp4", agentPort); err != nil {
-			return
-		}
-		if host, err = getRealHostGoc(ln); err != nil {
-			return
-		}
-	} else {
-		// 获取上次使用的监听地址
-		if previousAddr := getPreviousAddrGoc(); previousAddr != "" {
-			ss := strings.Split(previousAddr, ":")
-			// listenGoc on all network interface
-			ln, err = net.Listen("tcp4", ":"+ss[len(ss)-1])
-			if err == nil {
-				host = previousAddr
-				return
-			}
-		}
-		if ln, err = net.Listen("tcp4", ":0"); err != nil {
-			return
-		}
-		if host, err = getRealHostGoc(ln); err != nil {
+		ln, err = net.Listen("tcp4", agentPort)
+		return
+	}
+	// 获取上次使用的监听地址
+	if previousAddr := getPreviousAddrGoc(); previousAddr != "" {
+		ss := strings.Split(previousAddr, ":")
+		// listen on all network interface
+		ln, err = net.Listen("tcp4", ":"+ss[len(ss)-1])
+		// return if success, otherwise listen on random port
+		if err == nil {
 			return
 		}
 	}
-	go genProfileAddrGoc(host)
-	return
+	// 随机端口
+	return net.Listen("tcp4", ":0")
 }
 
 func getLocalIPGoc(hostOnly string) (string, error) {
@@ -364,7 +368,7 @@ func getLocalIPGoc(hostOnly string) (string, error) {
 	return ip, nil
 }
 
-func getRealHostGoc(ln net.Listener) (host string, err error) {
+func getRealHostGoc(port int) (host string, err error) {
 	centerUrl, err := url.Parse({{.Center | printf "%q" }})
 	if err != nil {
 		return "", err
@@ -373,12 +377,12 @@ func getRealHostGoc(ln net.Listener) (host string, err error) {
 	if err != nil {
 		return "", err
 	}
-	host = fmt.Sprintf("%s:%d", localIPV4, ln.Addr().(*net.TCPAddr).Port)
+	host = fmt.Sprintf("%s:%d", localIPV4, port)
 	err = nil
 	return
 }
 
-func getAllHostsGoc(ln net.Listener) (hosts []string, err error) {
+func getAllHostsGoc(port int) (hosts []string, err error) {
 	adds, err := net.InterfaceAddrs()
 	if err != nil {
 		return
@@ -387,7 +391,7 @@ func getAllHostsGoc(ln net.Listener) (hosts []string, err error) {
 	var host string
 	for _, addr := range adds {
 		if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
-			host = fmt.Sprintf("%s:%d", ipNet.IP.String(), ln.Addr().(*net.TCPAddr).Port)
+			host = fmt.Sprintf("%s:%d", ipNet.IP.String(), port)
 			hosts = append(hosts, host)
 		}
 	}
@@ -406,7 +410,7 @@ func getPreviousAddrGoc() string {
 	return string(addr)
 }
 
-func genProfileAddrGoc(profileAddr string) {
+func genProfileAddrGoc(port int) {
 	fn := os.Args[0] + "_profile_listen_addr"
 	f, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -415,7 +419,48 @@ func genProfileAddrGoc(profileAddr string) {
 	}
 	defer f.Close()
 
-	fmt.Fprintf(f, strings.TrimPrefix(profileAddr, "http://"))
+	host, err := getRealHostGoc(port)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(f, host)
+}
+
+// registerTickerGoc register evict schedule
+func registerTickerGoc(port int) {
+	if gocStopChan != nil {
+		return
+	}
+	gocStopChan = make(chan struct{})
+	gocTicker = time.NewTicker(heartbeatInterval)
+	go func() {
+		for {
+			ticker := gocTicker
+			if ticker == nil {
+				return
+			}
+			select {
+			case <-ticker.C:
+				if resp, err := registerSelfGoc(port); err != nil {
+					_log.Printf("register address failed, err: %v, response: %v", err, string(resp))
+				}
+			case <-gocStopChan:
+				return
+			}
+		}
+	}()
+}
+
+// releaseTickerGoc stop the ticker
+func releaseTickerGoc() {
+	if gocTicker != nil {
+		gocTicker.Stop()
+		gocTicker = nil
+	}
+	if gocStopChan != nil {
+		close(gocStopChan)
+		gocStopChan = nil
+	}
 }
 `
 
